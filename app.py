@@ -11,12 +11,7 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 st.set_page_config(page_title="PDF RAG QA", layout="wide")
 
 # 1. Point at the on‑disk PDF in data/
-DEFAULT_PDF_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "data",
-    "Credit_Card_Fraud_Detection_Using_State-of-the-Art_Machine_Learning_and_Deep_Learning_Algorithms.pdf"
-)
-
+DEFAULT_PDF_PATH = "article.pdf"
 # 2. Text extraction
 @st.cache_data(show_spinner=False)
 def extract_raw_text(path_or_bytes):
