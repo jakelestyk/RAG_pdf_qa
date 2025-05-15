@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-import os, re, streamlit as st
+import os
+import re
+import streamlit as st
 import pdfplumber
 import numpy as np
 import faiss
@@ -12,17 +14,16 @@ st.set_page_config(page_title="PDF RAG QA", layout="wide")
 #
 # ─── 1. CONFIGURE OPENAI ────────────────────────────────────────────────────────
 #
-# Ensure you have set your key in the environment:
-#   export OPENAI_API_KEY="your-key-here"
-openai.api_key = os.getenv("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")
+# Read your OpenAI key from Streamlit Secrets
+openai.api_key = os.getenv("OPENAI_API_KEY")
 if not openai.api_key:
-    st.error("⚠️ Please set your OPENAI_API_KEY environment variable")
+    st.error("⚠️ OPENAI_API_KEY not set. Add it under App Settings → Secrets.")
     st.stop()
 
 #
 # ─── 2. LOCATE BUNDLED PDF ──────────────────────────────────────────────────────
 #
-DEFAULT_PDF = "article.pdf"  # place your renamed PDF at project root
+DEFAULT_PDF = "article.pdf"  # Make sure this file lives at your repo root
 
 #
 # ─── 3. TEXT EXTRACTION ─────────────────────────────────────────────────────────
@@ -38,14 +39,16 @@ def extract_text(path_or_bytes):
             txt = p.extract_text() or ""
             lines = []
             for ln in txt.split("\n"):
-                # drop headers, footers, figure/table captions
-                if re.match(r"^\s*\d+\s*$", ln): 
+                # drop simple page numbers
+                if re.match(r"^\s*\d+\s*$", ln):
                     continue
-                if ln.strip().startswith(("Figure","Table")):
+                # drop figure/table captions
+                if ln.strip().startswith(("Figure", "Table")):
                     continue
                 lines.append(ln)
             pages.append(" ".join(lines))
     full = " ".join(pages)
+    # fix hyphens at line breaks & normalize whitespace
     full = re.sub(r'(?<=\w)-\s*(?=\w)', '', full)
     full = re.sub(r'\s+', ' ', full)
     return full
@@ -77,7 +80,6 @@ def build_bm25(chunks):
 #
 @st.cache_data(show_spinner=False)
 def embed_with_openai(chunks):
-    # call OpenAI in batches if needed
     embs = []
     for i in range(0, len(chunks), 50):
         batch = chunks[i : i + 50]
@@ -94,9 +96,9 @@ def embed_with_openai(chunks):
 @st.cache_data(show_spinner=False)
 def build_faiss_index(embs):
     dim = embs.shape[1]
-    index = faiss.IndexFlatIP(dim)
-    index.add(embs)
-    return index
+    idx = faiss.IndexFlatIP(dim)
+    idx.add(embs)
+    return idx
 
 #
 # ─── 7. FLAN‑T5 SETUP ────────────────────────────────────────────────────────────
@@ -107,22 +109,19 @@ gen_model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
 def generate_answer(question, contexts):
     prompt = (
         "You are a helpful assistant. Answer only from the context below. "
-        "If not found, respond with 'Information not found in the document.'\n\n"
+        "If not found, say 'Information not found in the document.'\n\n"
         f"Context:\n{contexts}\n\nQuestion: {question}\nAnswer:"
     )
-    try:
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
-        out = gen_model.generate(**inputs, max_new_tokens=100, no_repeat_ngram_size=2)
-        return tokenizer.decode(out[0], skip_special_tokens=True)
-    except Exception:
-        return "Information not found in the document."
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+    out = gen_model.generate(**inputs, max_new_tokens=100, no_repeat_ngram_size=2)
+    return tokenizer.decode(out[0], skip_special_tokens=True)
 
 #
 # ─── 8. HYBRID RETRIEVAL ─────────────────────────────────────────────────────────
 #
 def retrieve(query, chunks, bm25, tokenized, embs, faiss_idx, full_text, top_n=20, k=5):
     ql = query.lower()
-    # fallback rules
+    # rule‐based fallbacks for exact‐match facts
     if "dataset" in ql:
         m = re.search(r'([^.]*benchmark dataset[^.]*)\.', full_text, re.IGNORECASE)
         if m:
@@ -131,33 +130,17 @@ def retrieve(query, chunks, bm25, tokenized, embs, faiss_idx, full_text, top_n=2
         m = re.search(r'(\d+(?:\.\d+)?%)', full_text)
         if m:
             return [m.group(1)]
-    if "baseline" in ql:
-        m = re.search(r'such as ([^.]+)\.', full_text, re.IGNORECASE)
-        if m:
-            return [m.group(1) + "."]
-    if "false negative" in ql:
-        for c in chunks:
-            if "false negative" in c.lower():
-                return [c]
-
-    # BM25 stage
+    # BM25 pick top_n
     tokens = re.findall(r"\w+", ql)
     scores = bm25.get_scores(tokens)
     bm25_idxs = np.argsort(scores)[-top_n:][::-1]
-
     # semantic re-rank
-    q_emb = openai.Embedding.create(
-        model="text-embedding-ada-002", input=[query]
-    )["data"][0]["embedding"]
+    q_emb = openai.Embedding.create(model="text-embedding-ada-002", input=[query])["data"][0]["embedding"]
     q_emb = np.array(q_emb, dtype="float32").reshape(1, -1)
     faiss.normalize_L2(q_emb)
-    sims = []
-    for idx in bm25_idxs:
-        sims.append((float(np.dot(embs[idx], q_emb[0])), idx))
+    sims = [(float(np.dot(embs[i], q_emb[0])), i) for i in bm25_idxs]
     sims.sort(reverse=True)
-
-    # top-k
-    chosen = [idx for _, idx in sims[:k]]
+    chosen = [i for _, i in sims[:k]]
     return [chunks[i] for i in chosen]
 
 #
@@ -166,12 +149,10 @@ def retrieve(query, chunks, bm25, tokenized, embs, faiss_idx, full_text, top_n=2
 st.title("📄 PDF RAG QA Pipeline")
 st.write("Upload a PDF or leave blank to use the bundled research paper.")
 
-# uploader
 uploaded = st.file_uploader("Choose PDF", type="pdf")
 source = uploaded if uploaded else DEFAULT_PDF
 
-# load & index
-with st.spinner("Indexing PDF..."):
+with st.spinner("Indexing PDF…"):
     full_text = extract_text(source)
     if not full_text:
         st.stop()
@@ -180,15 +161,14 @@ with st.spinner("Indexing PDF..."):
     embs = embed_with_openai(chunks)
     faiss_idx = build_faiss_index(embs)
 
-# ask
 q = st.text_input("Enter your question:")
 if q:
-    with st.spinner("Retrieving..."):
+    with st.spinner("Retrieving…"):
         ctx = retrieve(q, chunks, bm25, tok, embs, faiss_idx, full_text)
     st.subheader("🔍 Retrieved Context")
     for i, c in enumerate(ctx, 1):
         st.write(f"**[{i}]** {c}")
-    with st.spinner("Generating answer..."):
+    with st.spinner("Generating answer…"):
         ans = generate_answer(q, "\n".join(ctx))
     st.subheader("💡 Answer")
     st.write(ans)
