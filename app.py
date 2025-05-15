@@ -14,8 +14,7 @@ st.set_page_config(page_title="PDF RAG QA", layout="wide")
 #
 # Ensure you have set your key in the environment:
 #   export OPENAI_API_KEY="your-key-here"
-openai.api_key = os.getenv("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")
-if not openai.api_key:
+openai.api_key = os.getenv("
     st.error("⚠️ Please set your OPENAI_API_KEY environment variable")
     st.stop()
 
