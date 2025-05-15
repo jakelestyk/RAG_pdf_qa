@@ -1,136 +1,138 @@
+@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import os
-import re
 import streamlit as st
+import os, sys, re
+import os, re
 import pdfplumber
 import numpy as np
 import faiss
-from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+@@ -10,44 +10,43 @@
 
-# ─── Streamlit config ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="PDF RAG QA", layout="wide")
 
-# ─── 1. BUNDLED PDF ────────────────────────────────────────────────────────────────
-DEFAULT_PDF = "article.pdf"   # put your PDF at repo root
+# 1. Point at the on‑disk PDF in data/
+# ─────────── Configuration ───────────
+# Point at the bundled PDF in the repo root
+DEFAULT_PDF_PATH = "article.pdf"
+# 2. Text extraction
 
-# ─── 2. TEXT EXTRACTION ────────────────────────────────────────────────────────────
+# ─────────── Text Extraction ───────────
 @st.cache_data(show_spinner=False)
-def extract_text(src):
-    if isinstance(src, str) and not os.path.exists(src):
-        st.error(f"PDF not found at `{src}`")
+def extract_raw_text(path_or_bytes):
+    # if we got a string path, verify it exists
+    # Accept either uploaded BytesIO or on‑disk path
+    if isinstance(path_or_bytes, str) and not os.path.exists(path_or_bytes):
+        st.error(f"Bundled PDF not found at {path_or_bytes}")
+        st.error(f"Bundled PDF not found at '{path_or_bytes}'")
         return ""
-    texts = []
-    with pdfplumber.open(src) as pdf:
-        for pg in pdf.pages:
-            t = pg.extract_text() or ""
-            lines = []
-            for ln in t.split("\n"):
-                # drop page numbers, headers/footers, figure/table captions
-                if re.fullmatch(r"\s*\d+\s*", ln): continue
-                if ln.strip().startswith(("Figure","Table")): continue
-                lines.append(ln)
-            texts.append(" ".join(lines))
-    full = " ".join(texts)
-    full = re.sub(r'(?<=\w)-\s*(?=\w)', "", full)
-    full = re.sub(r"\s+", " ", full)
+    pages = []
+    with pdfplumber.open(path_or_bytes) as pdf:
+        for p in pdf.pages:
+            txt = p.extract_text() or ""
+            lines = [
+                ln for ln in txt.split("\n")
+                if not ln.strip().startswith(("Figure","Table"))
+            ]
+            # Skip figure/table captions
+            lines = [ln for ln in txt.split("\n") if not ln.strip().startswith(("Figure","Table"))]
+            pages.append(" ".join(lines))
+    full = " ".join(pages)
+    # fix hyphens and normalize whitespace
+    # Repair hyphenated line‑breaks and collapse whitespace
+    full = re.sub(r'(?<=\w)-\s*(?=\w)', '', full)
+    full = re.sub(r'\s+', ' ', full)
     return full
 
-# ─── 3. CHUNKING ───────────────────────────────────────────────────────────────────
+# 3. Sentence splitting
+# ─────────── Sentence Splitting ───────────
 @st.cache_data(show_spinner=False)
-def chunk_text(txt, size=800, overlap=100):
-    out, i = [], 0
-    while i < len(txt):
-        out.append(txt[i:i+size])
-        i += size - overlap
-    return out
+def split_sentences(full_text):
+    sents = re.split(r'(?<=[\.!?])\s+', full_text)
+    return [s.strip() for s in sents if len(s.strip()) >= 50]
 
-# ─── 4. BM25 INDEX ────────────────────────────────────────────────────────────────
+# 4. BM25 index
+# ─────────── BM25 Indexing ───────────
 @st.cache_data(show_spinner=False)
-def build_bm25(chunks):
-    toks = [re.findall(r"\w+", c.lower()) for c in chunks]
-    return BM25Okapi(toks), toks
+def build_bm25(sentences):
+    tokenized = [re.findall(r"\w+", s.lower()) for s in sentences]
+    return BM25Okapi(tokenized), tokenized
 
-# ─── 5. LOCAL EMBEDDINGS + FAISS ──────────────────────────────────────────────────
-st.spinner("Loading local embedder…")
-embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-
-@st.cache_data(show_spinner=False)
-def embed_chunks(chunks):
-    embs = embed_model.encode(chunks, convert_to_numpy=True, show_progress_bar=False)
-    faiss.normalize_L2(embs)
-    return embs
+# 5. Embeddings & FAISS
+st.spinner("Loading embedding model…")
+# ─────────── Embeddings & FAISS ───────────
+embed_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 @st.cache_data(show_spinner=False)
-def build_faiss(embs):
-    dim = embs.shape[1]
-    idx = faiss.IndexFlatIP(dim)
+@@ -63,15 +62,13 @@ def build_faiss_index(embs):
     idx.add(embs)
     return idx
 
-# ─── 6. FLAN‑T5 SETUP ──────────────────────────────────────────────────────────────
-st.spinner("Loading Flan‑T5…")
+# 6. Load Flan‑T5 for generation
+st.spinner("Loading Flan‑T5 model…")
+# ─────────── Answer Generation ───────────
 tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
 gen_model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
 
-def generate_answer(question, context):
-    prompt = (
-        "You are a helpful assistant. Answer only from the context below.\n"
-        "If not found, say 'Information not found in the document.'\n\n"
-        f"Context:\n{context}\n\nQuestion: {question}\nAnswer:"
-    )
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
-    out = gen_model.generate(**inputs, max_new_tokens=100, no_repeat_ngram_size=2)
-    return tokenizer.decode(out[0], skip_special_tokens=True)
-
-# ─── 7. HYBRID RETRIEVAL ────────────────────────────────────────────────────────────
-def hybrid_retrieve(query, chunks, bm25, toks, embs, faiss_idx, full_text, top_n=20, k=5):
+# 7. Retrieval + fallbacks
+def retrieve(query, sents, bm25, tokenized, embs, faiss_idx, full_text, top_n=20, k=3):
     ql = query.lower()
-
-    # simple fallback for well‑known patterns
+    # FALLBACKS:
+    # Fallbacks:
     if "dataset" in ql:
-        m = re.search(r"([^.]*benchmark dataset[^.]*)\.", full_text, re.IGNORECASE)
-        if m: return [m.group(1)+"."]
-
-    # BM25
-    q_tokens = re.findall(r"\w+", ql)
-    bm25_scores = bm25.get_scores(q_tokens)
-    top_idxs = np.argsort(bm25_scores)[-top_n:][::-1]
-
-    # semantic re‑rank
+        m = re.search(r'([^.]*benchmark dataset[^.]*)\.', full_text, re.IGNORECASE)
+        if m: return [m.group(1).strip() + "."]
+@@ -83,12 +80,13 @@ def retrieve(query, sents, bm25, tokenized, embs, faiss_idx, full_text, top_n=20
+        if m: return [m.group(1).strip() + "."]
+    if "false negative" in ql:
+        for s in sents:
+            if "false negative" in s.lower(): return [s]
+    # BM25 stage
+            if "false negative" in s.lower():
+                return [s]
+    # BM25 lexical retrieval
+    tokens = re.findall(r"\w+", ql)
+    scores = bm25.get_scores(tokens)
+    idxs = np.argsort(scores)[-top_n:][::-1]
+    # embedding re-rank
+    # Embedding re-rank
     q_emb = embed_model.encode([query], convert_to_numpy=True)
     faiss.normalize_L2(q_emb)
-    sims = [(float(np.dot(embs[i], q_emb[0])), i) for i in top_idxs]
-    sims.sort(reverse=True)
+    sims = [(float(np.dot(embs[i], q_emb[0])), i) for i in idxs]
+@@ -107,17 +105,14 @@ def generate_answer(question, contexts):
+    out = gen_model.generate(**enc, max_new_tokens=75, no_repeat_ngram_size=2)
+    return tokenizer.decode(out[0], skip_special_tokens=True)
 
-    chosen = [i for _,i in sims[:k]]
-    return [chunks[i] for i in chosen]
+# ──────────── Streamlit UI ────────────
+# ─────────── Streamlit UI ───────────
+st.title("📄 PDF RAG Question–Answering")
+st.write("Upload your own PDF or leave blank to use the bundled research paper.")
+st.write("Upload your own PDF, or leave blank to use the bundled research paper.")
 
-# ─── 8. STREAMLIT UI ──────────────────────────────────────────────────────────────
-st.title("📄 PDF RAG QA Pipeline")
-st.write("Upload a PDF or leave blank to use the bundled research article.")
+# File uploader (optional)
+# Optional upload
+uploaded = st.file_uploader("Choose a PDF file", type="pdf")
 
-uploaded = st.file_uploader("Choose PDF", type="pdf")
-source = uploaded if uploaded else DEFAULT_PDF
+# decide source: uploaded or default on‑disk
+source = uploaded if uploaded else DEFAULT_PDF_PATH
 
-with st.spinner("Indexing…"):
-    text = extract_text(source)
-    if not text:
-        st.stop()
-    chunks = chunk_text(text)
-    bm25, toks = build_bm25(chunks)
-    embs = embed_chunks(chunks)
-    idx = build_faiss(embs)
+# Load & index
+with st.spinner("Loading and indexing PDF…"):
+    full_text = extract_raw_text(source)
+    if not full_text:
+@@ -127,14 +122,13 @@ def generate_answer(question, contexts):
+    embs = embed_sentences(sentences)
+    faiss_idx = build_faiss_index(embs)
 
+# Ask & answer
 q = st.text_input("Enter your question:")
 if q:
-    with st.spinner("Retrieving…"):
-        ctxs = hybrid_retrieve(q, chunks, bm25, toks, embs, idx, text)
+    with st.spinner("Retrieving context…"):
+        ctxs = retrieve(q, sentences, bm25, tokenized, embs, faiss_idx, full_text)
     st.subheader("🔍 Retrieved Context")
-    for i,c in enumerate(ctxs,1):
+    for i, c in enumerate(ctxs, 1):
         st.write(f"**[{i}]** {c}")
-    with st.spinner("Answering…"):
-        answer = generate_answer(q, "\n".join(ctxs))
+    for idx, c in enumerate(ctxs, 1):
+        st.write(f"**[{idx}]** {c}")
+    with st.spinner("Generating answer…"):
+        ans = generate_answer(q, ctxs)
     st.subheader("💡 Answer")
-    st.write(answer)
