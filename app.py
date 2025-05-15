@@ -1,138 +1,132 @@
-@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
+# app.py
+
 import streamlit as st
-import os, sys, re
-import os, re
-import pdfplumber
+import re
 import numpy as np
+import pdfplumber
 import faiss
-@@ -10,44 +10,43 @@
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-st.set_page_config(page_title="PDF RAG QA", layout="wide")
-
-# 1. Point at the on‑disk PDF in data/
-# ─────────── Configuration ───────────
-# Point at the bundled PDF in the repo root
-DEFAULT_PDF_PATH = "article.pdf"
-# 2. Text extraction
-
-# ─────────── Text Extraction ───────────
-@st.cache_data(show_spinner=False)
-def extract_raw_text(path_or_bytes):
-    # if we got a string path, verify it exists
-    # Accept either uploaded BytesIO or on‑disk path
-    if isinstance(path_or_bytes, str) and not os.path.exists(path_or_bytes):
-        st.error(f"Bundled PDF not found at {path_or_bytes}")
-        st.error(f"Bundled PDF not found at '{path_or_bytes}'")
-        return ""
+# 1) Extraction
+def extract_raw_text(pdf_bytes):
     pages = []
-    with pdfplumber.open(path_or_bytes) as pdf:
+    with pdfplumber.open(pdf_bytes) as pdf:
         for p in pdf.pages:
             txt = p.extract_text() or ""
             lines = [
                 ln for ln in txt.split("\n")
-                if not ln.strip().startswith(("Figure","Table"))
+                if not ln.strip().startswith(("Figure", "Table"))
             ]
-            # Skip figure/table captions
-            lines = [ln for ln in txt.split("\n") if not ln.strip().startswith(("Figure","Table"))]
             pages.append(" ".join(lines))
     full = " ".join(pages)
-    # fix hyphens and normalize whitespace
-    # Repair hyphenated line‑breaks and collapse whitespace
     full = re.sub(r'(?<=\w)-\s*(?=\w)', '', full)
     full = re.sub(r'\s+', ' ', full)
     return full
 
-# 3. Sentence splitting
-# ─────────── Sentence Splitting ───────────
-@st.cache_data(show_spinner=False)
+# 2) Chunking
 def split_sentences(full_text):
     sents = re.split(r'(?<=[\.!?])\s+', full_text)
     return [s.strip() for s in sents if len(s.strip()) >= 50]
 
-# 4. BM25 index
-# ─────────── BM25 Indexing ───────────
-@st.cache_data(show_spinner=False)
+# 3) BM25 index
 def build_bm25(sentences):
     tokenized = [re.findall(r"\w+", s.lower()) for s in sentences]
     return BM25Okapi(tokenized), tokenized
 
-# 5. Embeddings & FAISS
-st.spinner("Loading embedding model…")
-# ─────────── Embeddings & FAISS ───────────
-embed_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+# 4) Embeddings + FAISS
+@st.cache_resource(show_spinner=False)
+def load_embed_model():
+    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-@st.cache_data(show_spinner=False)
-@@ -63,15 +62,13 @@ def build_faiss_index(embs):
+def embed_sentences(model, sentences):
+    embs = model.encode(sentences, convert_to_numpy=True)
+    faiss.normalize_L2(embs)
+    return embs
+
+def build_faiss_index(embs):
+    dim = embs.shape[1]
+    idx = faiss.IndexFlatIP(dim)
     idx.add(embs)
     return idx
 
-# 6. Load Flan‑T5 for generation
-st.spinner("Loading Flan‑T5 model…")
-# ─────────── Answer Generation ───────────
-tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
-gen_model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
-
-# 7. Retrieval + fallbacks
-def retrieve(query, sents, bm25, tokenized, embs, faiss_idx, full_text, top_n=20, k=3):
+# 5) Retrieval with fallbacks
+def retrieve(sentences, bm25, tokenized, embs, faiss_idx, full_text, query):
     ql = query.lower()
-    # FALLBACKS:
-    # Fallbacks:
+    # dataset
     if "dataset" in ql:
         m = re.search(r'([^.]*benchmark dataset[^.]*)\.', full_text, re.IGNORECASE)
         if m: return [m.group(1).strip() + "."]
-@@ -83,12 +80,13 @@ def retrieve(query, sents, bm25, tokenized, embs, faiss_idx, full_text, top_n=20
+    # accuracy
+    if "accuracy" in ql:
+        m = re.search(r'(\d+(?:\.\d+)?%)', full_text)
+        if m: return [m.group(1)]
+    # baseline
+    if "baseline" in ql or ("machine learning" in ql and "methods" in ql):
+        m = re.search(r'such as ([^.]+)\.', full_text, re.IGNORECASE)
         if m: return [m.group(1).strip() + "."]
+    # false negative
     if "false negative" in ql:
-        for s in sents:
-            if "false negative" in s.lower(): return [s]
-    # BM25 stage
+        for s in sentences:
             if "false negative" in s.lower():
                 return [s]
-    # BM25 lexical retrieval
+    # BM25
     tokens = re.findall(r"\w+", ql)
     scores = bm25.get_scores(tokens)
-    idxs = np.argsort(scores)[-top_n:][::-1]
-    # embedding re-rank
-    # Embedding re-rank
+    idxs = np.argsort(scores)[-20:][::-1]
+    # embedding re‑rank
+    embed_model = load_embed_model()
     q_emb = embed_model.encode([query], convert_to_numpy=True)
     faiss.normalize_L2(q_emb)
-    sims = [(float(np.dot(embs[i], q_emb[0])), i) for i in idxs]
-@@ -107,17 +105,14 @@ def generate_answer(question, contexts):
-    out = gen_model.generate(**enc, max_new_tokens=75, no_repeat_ngram_size=2)
+    sims = [(np.dot(embs[i], q_emb[0]), i) for i in idxs]
+    sims.sort(reverse=True)
+    chosen = [i for _, i in sims[:3]]
+    return [sentences[i] for i in chosen]
+
+# 6) Flan‑T5 answer generation
+@st.cache_resource(show_spinner=False)
+def load_flant5():
+    tok = AutoTokenizer.from_pretrained("google/flan-t5-base")
+    mdl = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
+    return tok, mdl
+
+def generate_answer(tokenizer, model, question, contexts):
+    ctx = " ".join(contexts)
+    prompt = (
+        "You are a helpful assistant. Answer only from the context below.\n"
+        "If not found, say 'Information not found in the document.'\n\n"
+        f"Context:\n{ctx}\n\n"
+        f"Question: {question}\nAnswer:"
+    )
+    enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+    out = model.generate(**enc, max_new_tokens=75, no_repeat_ngram_size=2)
     return tokenizer.decode(out[0], skip_special_tokens=True)
 
-# ──────────── Streamlit UI ────────────
 # ─────────── Streamlit UI ───────────
-st.title("📄 PDF RAG Question–Answering")
-st.write("Upload your own PDF or leave blank to use the bundled research paper.")
-st.write("Upload your own PDF, or leave blank to use the bundled research paper.")
+st.title("PDF Question Answering with RAG")
 
-# File uploader (optional)
-# Optional upload
-uploaded = st.file_uploader("Choose a PDF file", type="pdf")
+uploaded = st.file_uploader("Upload a research PDF", type=["pdf"])
+if uploaded:
+    with st.spinner("Processing PDF…"):
+        full_text = extract_raw_text(uploaded)
+        sentences = split_sentences(full_text)
+        bm25, tokenized = build_bm25(sentences)
+        embed_model = load_embed_model()
+        embs = embed_sentences(embed_model, sentences)
+        faiss_idx = build_faiss_index(embs)
 
-# decide source: uploaded or default on‑disk
-source = uploaded if uploaded else DEFAULT_PDF_PATH
+    st.success(f"PDF processed: {len(sentences)} sentences indexed.")
 
-# Load & index
-with st.spinner("Loading and indexing PDF…"):
-    full_text = extract_raw_text(source)
-    if not full_text:
-@@ -127,14 +122,13 @@ def generate_answer(question, contexts):
-    embs = embed_sentences(sentences)
-    faiss_idx = build_faiss_index(embs)
+    question = st.text_input("Enter your question:")
+    if st.button("Get Answer") and question:
+        with st.spinner("Retrieving answer…"):
+            contexts = retrieve(sentences, bm25, tokenized, embs, faiss_idx, full_text, question)
+            tok, model = load_flant5()
+            answer = generate_answer(tok, model, question, contexts)
 
-# Ask & answer
-q = st.text_input("Enter your question:")
-if q:
-    with st.spinner("Retrieving context…"):
-        ctxs = retrieve(q, sentences, bm25, tokenized, embs, faiss_idx, full_text)
-    st.subheader("🔍 Retrieved Context")
-    for i, c in enumerate(ctxs, 1):
-        st.write(f"**[{i}]** {c}")
-    for idx, c in enumerate(ctxs, 1):
-        st.write(f"**[{idx}]** {c}")
-    with st.spinner("Generating answer…"):
-        ans = generate_answer(q, ctxs)
-    st.subheader("💡 Answer")
+        st.subheader("Retrieved Context")
+        for i, c in enumerate(contexts, 1):
+            st.write(f"**[{i}]** {c}")
+        st.subheader("Answer")
+        st.write(answer)
